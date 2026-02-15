@@ -103,7 +103,7 @@ fn flipBit(bytes: []u8, bit_pos: usize) void {
     bytes[byte_idx] ^= @as(u8, 1) << bit_idx;
 }
 
-fn bitsToBytes(soft_bits: []const SoftBit, out: []u8) void {
+pub fn bitsToBytes(soft_bits: []const SoftBit, out: []u8) void {
     for (0..out.len) |byte_idx| {
         var byte_val: u8 = 0;
         for (0..8) |bit_idx| {

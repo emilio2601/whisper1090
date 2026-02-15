@@ -16,6 +16,26 @@ pub const DownlinkFormat = enum(u5) {
     _,
 };
 
+pub const IcaoFilter = struct {
+    known: std.AutoHashMap(u24, void),
+
+    pub fn init(allocator: std.mem.Allocator) IcaoFilter {
+        return .{ .known = std.AutoHashMap(u24, void).init(allocator) };
+    }
+
+    pub fn deinit(self: *IcaoFilter) void {
+        self.known.deinit();
+    }
+
+    pub fn add(self: *IcaoFilter, icao: u24) void {
+        self.known.put(icao, {}) catch {};
+    }
+
+    pub fn contains(self: *const IcaoFilter, icao: u24) bool {
+        return self.known.contains(icao);
+    }
+};
+
 pub const Message = struct {
     raw: [14]u8,
     len: u8,
@@ -32,6 +52,7 @@ pub const Message = struct {
         num_bits: usize,
         timestamp_ns: u64,
         signal_level: u16,
+        icao_filter: ?*const IcaoFilter,
     ) ?Message {
         if (num_bits < 56) return null;
 
@@ -48,28 +69,36 @@ pub const Message = struct {
         );
 
         msg.df = @enumFromInt(df_val);
-
-        // Determine message length from DF
         msg.len = if (df_val >= 16) 14 else 7;
         const required_bits = @as(usize, msg.len) * 8;
         if (num_bits < required_bits) return null;
 
         @memcpy(msg.soft_bits[0..required_bits], soft_bits[0..required_bits]);
 
-        const result = crc.softCrcCorrect(msg.soft_bits[0..required_bits], msg.raw[0..msg.len]);
-        msg.crc_ok = result.crc_ok;
-        msg.crc_corrected_bits = result.bits_corrected;
-
-        if (!msg.crc_ok) return null;
-
-        // Extract ICAO: for DF17/18 it's bytes 1-3
-        // For other DFs, ICAO is XORed with the CRC remainder
         switch (msg.df) {
             .extended_squitter, .extended_squitter_non_transponder => {
+                // DF17/18: CRC covers entire message, remainder must be 0
+                const result = crc.softCrcCorrect(msg.soft_bits[0..required_bits], msg.raw[0..msg.len]);
+                msg.crc_ok = result.crc_ok;
+                msg.crc_corrected_bits = result.bits_corrected;
+                if (!msg.crc_ok) return null;
                 msg.icao = @as(u24, msg.raw[1]) << 16 | @as(u24, msg.raw[2]) << 8 | msg.raw[3];
             },
             else => {
-                msg.icao = @as(u24, msg.raw[1]) << 16 | @as(u24, msg.raw[2]) << 8 | msg.raw[3];
+                // Other DFs: CRC remainder = ICAO address (address/parity)
+                crc.bitsToBytes(msg.soft_bits[0..required_bits], msg.raw[0..msg.len]);
+                const remainder = crc.computeCrc24(msg.raw[0..msg.len]);
+                if (remainder == 0) return null;
+                const icao: u24 = @truncate(remainder);
+
+                // Only accept if ICAO was previously seen in a DF17/18
+                if (icao_filter) |filter| {
+                    if (!filter.contains(icao)) return null;
+                }
+
+                msg.icao = icao;
+                msg.crc_ok = true;
+                msg.crc_corrected_bits = 0;
             },
         }
 
@@ -93,7 +122,7 @@ test "fromSoftBits with known DF17 message" {
         soft_bits[i] = .{ .hard = hard, .llr_f32 = if (hard == 1) 100.0 else -100.0 };
     }
 
-    const msg = Message.fromSoftBits(&soft_bits, 112, 0, 500);
+    const msg = Message.fromSoftBits(&soft_bits, 112, 0, 500, null);
     try std.testing.expect(msg != null);
     try std.testing.expectEqual(DownlinkFormat.extended_squitter, msg.?.df);
     try std.testing.expectEqual(@as(u24, 0x4840D6), msg.?.icao);
