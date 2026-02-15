@@ -23,6 +23,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var ifile_path: ?[]const u8 = null;
+    var sample_rate: u32 = 2_400_000;
     var show_stats = false;
 
     var i: usize = 1;
@@ -30,17 +31,20 @@ pub fn main() !void {
         if (std.mem.eql(u8, args[i], "--ifile") and i + 1 < args.len) {
             ifile_path = args[i + 1];
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--sample-rate") and i + 1 < args.len) {
+            sample_rate = std.fmt.parseInt(u32, args[i + 1], 10) catch 2_400_000;
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--stats")) {
             show_stats = true;
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
-            std.debug.print("Usage: whisper1090 --ifile <path.iq> [--stats]\n", .{});
+            std.debug.print("Usage: whisper1090 --ifile <path.iq> [--sample-rate <hz>] [--stats]\n", .{});
             return;
         }
     }
 
     if (ifile_path == null) {
         std.debug.print("whisper1090: soft-decision ADS-B decoder\n", .{});
-        std.debug.print("Usage: whisper1090 --ifile <path.iq> [--stats]\n", .{});
+        std.debug.print("Usage: whisper1090 --ifile <path.iq> [--sample-rate <hz>] [--stats]\n", .{});
         return;
     }
 
@@ -50,6 +54,8 @@ pub fn main() !void {
     var stats = stats_mod.Stats.init();
     var table = aircraft_mod.AircraftTable.init(allocator);
     defer table.deinit();
+    var icao_filter = message_mod.IcaoFilter.init(allocator);
+    defer icao_filter.deinit();
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_bw = std.fs.File.stdout().writer(&stdout_buf);
@@ -63,6 +69,9 @@ pub fn main() !void {
     var mag_buf: [max_mag_samples]u16 = undefined;
 
     var total_sample_offset: u64 = 0;
+
+    const preamble_len = preamble.preambleSamples(sample_rate);
+    const max_msg_samples = demod.samplesForBits(112, sample_rate);
 
     while (true) {
         var offset: usize = 0;
@@ -82,54 +91,64 @@ pub fn main() !void {
         magnitude.computeMagnitude(read_buf[0..aligned_bytes], mag_buf[0..num_samples]);
         stats.samples_processed += num_samples;
 
-        const preamble_len = preamble.preamble_samples;
-        const max_msg_samples: usize = @intFromFloat(@round(112.0 * demod.samples_per_bit));
-
         var pos: usize = 0;
         while (pos + preamble_len + max_msg_samples <= num_samples) {
-            if (!preamble.detectPreamble(mag_buf[0..num_samples], pos)) {
+            if (!preamble.detectPreamble(mag_buf[0..num_samples], pos, sample_rate)) {
                 pos += 1;
                 continue;
             }
 
             stats.preambles_detected += 1;
 
-            const data_start = pos + preamble_len;
-            const timestamp_ns = (total_sample_offset + pos) * 1000 / 2400 * 1000;
+            const timestamp_ns = (total_sample_offset + pos) * 1_000_000_000 / sample_rate;
 
+            // Try multiple phase offsets to handle non-integer sample alignment
             var decoded = false;
-            for ([_]usize{ 112, 56 }) |num_bits| {
-                const needed_samples: usize = @intFromFloat(@round(@as(f32, @floatFromInt(num_bits)) * demod.samples_per_bit));
-                if (data_start + needed_samples > num_samples) continue;
+            const phase_offsets = [_]i8{ 0, -1, 1, -2, 2 };
+            phase_loop: for (phase_offsets) |phase| {
+                const base: usize = pos + preamble_len;
+                const data_start: usize = if (phase < 0)
+                    base -| @as(usize, @intCast(-phase))
+                else
+                    base + @as(usize, @intCast(phase));
 
-                var soft_bits: [112]SoftBit = undefined;
-                demod.extractSoftBits(mag_buf[0..num_samples], data_start, soft_bits[0..num_bits]);
+                for ([_]usize{ 112, 56 }) |num_bits| {
+                    const needed_samples = demod.samplesForBits(num_bits, sample_rate);
+                    if (data_start + needed_samples > num_samples) continue;
 
-                const signal_level = demod.computeSignalLevel(mag_buf[0..num_samples], data_start, num_bits);
+                    var soft_bits: [112]SoftBit = undefined;
+                    demod.extractSoftBits(mag_buf[0..num_samples], data_start, soft_bits[0..num_bits], sample_rate);
 
-                if (Message.fromSoftBits(soft_bits[0..num_bits], num_bits, timestamp_ns, signal_level)) |msg| {
-                    stats.messages_decoded += 1;
-                    if (msg.crc_corrected_bits > 0) {
-                        stats.crc_corrected += 1;
-                    } else {
-                        stats.crc_ok += 1;
-                    }
+                    const signal_level = demod.computeSignalLevel(mag_buf[0..num_samples], data_start, num_bits, sample_rate);
 
-                    const payload = decode.decodeExtendedSquitter(&msg);
-                    const ac = table.getOrCreate(msg.icao) catch null;
-                    if (ac) |a| {
-                        a.updateFromPayload(payload, msg.timestamp_ns);
-                        if (a.messages_received == 1) {
-                            stats.unique_aircraft += 1;
+                    if (Message.fromSoftBits(soft_bits[0..num_bits], num_bits, timestamp_ns, signal_level, &icao_filter)) |msg| {
+                        stats.messages_decoded += 1;
+                        if (msg.crc_corrected_bits > 0) {
+                            stats.crc_corrected += 1;
+                        } else {
+                            stats.crc_ok += 1;
                         }
+
+                        if (msg.df == .extended_squitter or msg.df == .extended_squitter_non_transponder) {
+                            icao_filter.add(msg.icao);
+                        }
+
+                        const payload = decode.decodeExtendedSquitter(&msg);
+                        const ac = table.getOrCreate(msg.icao) catch null;
+                        if (ac) |a| {
+                            a.updateFromPayload(payload, msg.timestamp_ns);
+                            if (a.messages_received == 1) {
+                                stats.unique_aircraft += 1;
+                            }
+                        }
+
+                        printMessage(stdout, &msg, payload) catch {};
+
+                        const skip_samples = demod.samplesForBits(num_bits, sample_rate);
+                        pos = data_start + skip_samples;
+                        decoded = true;
+                        break :phase_loop;
                     }
-
-                    printMessage(stdout, &msg, payload) catch {};
-
-                    const skip_samples: usize = @intFromFloat(@round(@as(f32, @floatFromInt(num_bits)) * demod.samples_per_bit));
-                    pos = data_start + skip_samples;
-                    decoded = true;
-                    break;
                 }
             }
 
@@ -153,7 +172,9 @@ pub fn main() !void {
 
     try stdout.flush();
 
-    stats.debugPrint();
+    if (show_stats) {
+        stats.debugPrint();
+    }
 }
 
 fn printMessage(writer: anytype, msg: *const Message, payload: decode.DecodedPayload) !void {
