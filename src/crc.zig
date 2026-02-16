@@ -37,35 +37,150 @@ pub fn softCrcCorrect(soft_bits: []SoftBit, msg_bytes: []u8) SoftCrcResult {
 
     const syndrome = computeCrc24(msg_bytes);
 
-    const max_candidates: usize = if (is_long) 15 else 8;
-    var candidates: [15]usize = undefined;
-    const n_cand = collectWeakBits(soft_bits[0..num_bits], candidates[0..max_candidates]);
-
-    // Try 1-bit flips
-    for (candidates[0..n_cand]) |b0| {
-        if (syndromeForBit(b0, msg_bytes.len) == syndrome) {
-            flipBit(msg_bytes, b0);
-            soft_bits[b0].hard ^= 1;
-            return .{ .crc_ok = true, .bits_corrected = 1 };
-        }
+    // Phase 1: Brute-force syndrome table for 1-bit errors (all positions)
+    const syn1 = if (is_long) SyndromeTable112.lookup1(syndrome) else SyndromeTable56.lookup1(syndrome);
+    if (syn1) |bit_pos| {
+        flipBit(msg_bytes, bit_pos);
+        soft_bits[bit_pos].hard ^= 1;
+        return .{ .crc_ok = true, .bits_corrected = 1 };
     }
 
-    // 2-bit correction only for long (112-bit) messages
-    if (!is_long) return .{ .crc_ok = false, .bits_corrected = 0 };
-
-    for (0..n_cand) |i| {
-        for (i + 1..n_cand) |j| {
-            if (syndromeForBit(candidates[i], msg_bytes.len) ^ syndromeForBit(candidates[j], msg_bytes.len) == syndrome) {
-                flipBit(msg_bytes, candidates[i]);
-                flipBit(msg_bytes, candidates[j]);
-                soft_bits[candidates[i]].hard ^= 1;
-                soft_bits[candidates[j]].hard ^= 1;
+    // Phase 2: Brute-force 2-bit using syndrome table
+    // For each bit position, check if (syndrome ^ syndromeForBit(b)) is a known 1-bit syndrome
+    const syn_table = if (is_long) &SyndromeTable112.table else &SyndromeTable56.table;
+    const max_bits: usize = if (is_long) 112 else 56;
+    for (0..max_bits) |b0| {
+        const s0 = syn_table[b0];
+        const residual = syndrome ^ s0;
+        const b1_opt = if (is_long) SyndromeTable112.lookup1(residual) else SyndromeTable56.lookup1(residual);
+        if (b1_opt) |b1| {
+            if (b1 > b0) {
+                flipBit(msg_bytes, b0);
+                flipBit(msg_bytes, b1);
+                soft_bits[b0].hard ^= 1;
+                soft_bits[b1].hard ^= 1;
                 return .{ .crc_ok = true, .bits_corrected = 2 };
             }
         }
     }
 
+    // Phase 3: Soft-bit 3-bit correction (weakest N candidates)
+    if (!is_long) return .{ .crc_ok = false, .bits_corrected = 0 };
+
+    const max_candidates: usize = 15;
+    var candidates: [15]usize = undefined;
+    const n_cand = collectWeakBits(soft_bits[0..num_bits], candidates[0..max_candidates]);
+
+    var synd: [15]u32 = undefined;
+    for (0..n_cand) |ci| {
+        synd[ci] = syn_table[candidates[ci]];
+    }
+
+    for (0..n_cand) |ci| {
+        for (ci + 1..n_cand) |cj| {
+            const s2 = synd[ci] ^ synd[cj];
+            for (cj + 1..n_cand) |ck| {
+                if (s2 ^ synd[ck] == syndrome) {
+                    flipBit(msg_bytes, candidates[ci]);
+                    flipBit(msg_bytes, candidates[cj]);
+                    flipBit(msg_bytes, candidates[ck]);
+                    soft_bits[candidates[ci]].hard ^= 1;
+                    soft_bits[candidates[cj]].hard ^= 1;
+                    soft_bits[candidates[ck]].hard ^= 1;
+                    return .{ .crc_ok = true, .bits_corrected = 3 };
+                }
+            }
+        }
+    }
+
     return .{ .crc_ok = false, .bits_corrected = 0 };
+}
+
+// Comptime syndrome tables: precomputed CRC-24 syndrome for each single-bit error position.
+// Used for O(1) lookup of 1-bit corrections and O(n) lookup of 2-bit corrections.
+fn SyndromeTableFor(comptime n_bits: usize) type {
+    const n_bytes = n_bits / 8;
+
+    return struct {
+        const table: [n_bits]u32 = blk: {
+            var t: [n_bits]u32 = undefined;
+            for (0..n_bits) |bit_pos| {
+                var temp: [n_bytes]u8 = .{0} ** n_bytes;
+                const byte_idx = bit_pos / 8;
+                const bit_idx: u3 = @intCast(7 - (bit_pos % 8));
+                temp[byte_idx] = @as(u8, 1) << bit_idx;
+                t[bit_pos] = computeCrc24Comptime(&temp);
+            }
+            break :blk t;
+        };
+
+        // Map from syndrome value → bit position.
+        // Simple perfect hash isn't possible, so use a flat array indexed by syndrome.
+        // 24-bit syndromes → 16M entries is too large. Use a small hash map instead.
+        const hash_bits = 8; // 256 buckets
+        const bucket_count = 1 << hash_bits;
+        const max_chain = 4; // max entries per bucket
+
+        const Entry = struct { syndrome: u32, bit_pos: u8 };
+        const Bucket = struct {
+            entries: [max_chain]Entry,
+            len: u8,
+        };
+
+        const hash_table: [bucket_count]Bucket = blk: {
+            @setEvalBranchQuota(1_000_000);
+            var ht: [bucket_count]Bucket = undefined;
+            for (&ht) |*b| {
+                b.len = 0;
+                for (&b.entries) |*e| {
+                    e.syndrome = 0;
+                    e.bit_pos = 0;
+                }
+            }
+            for (0..n_bits) |bit_pos| {
+                const s = table[bit_pos];
+                const idx = hashSyndrome(s);
+                const b = &ht[idx];
+                if (b.len < max_chain) {
+                    b.entries[b.len] = .{ .syndrome = s, .bit_pos = @intCast(bit_pos) };
+                    b.len += 1;
+                }
+            }
+            break :blk ht;
+        };
+
+        fn hashSyndrome(s: u32) usize {
+            // XOR-fold 24 bits into hash_bits
+            return @as(usize, (s ^ (s >> 8) ^ (s >> 16)) & (bucket_count - 1));
+        }
+
+        fn lookup1(syndrome: u32) ?usize {
+            const idx = hashSyndrome(syndrome);
+            const bucket = hash_table[idx];
+            for (bucket.entries[0..bucket.len]) |e| {
+                if (e.syndrome == syndrome) return @as(usize, e.bit_pos);
+            }
+            return null;
+        }
+    };
+}
+
+const SyndromeTable56 = SyndromeTableFor(56);
+const SyndromeTable112 = SyndromeTableFor(112);
+
+fn computeCrc24Comptime(data: []const u8) u32 {
+    @setEvalBranchQuota(100_000);
+    var c: u32 = 0;
+    for (data) |byte| {
+        c ^= @as(u32, byte) << 16;
+        for (0..8) |_| {
+            c <<= 1;
+            if (c & 0x1000000 != 0) {
+                c ^= generator;
+            }
+        }
+    }
+    return c & 0xFFFFFF;
 }
 
 fn syndromeForBit(bit_pos: usize, msg_len: usize) u32 {
