@@ -52,6 +52,50 @@ pub fn softBitsToBytes(soft_bits: []const SoftBit, out: []u8) void {
     }
 }
 
+pub fn resampleAndExtract(
+    magnitude: []const u16,
+    data_start: usize,
+    fractional_offset: f32,
+    num_bits: usize,
+    sample_rate_hz: u32,
+    out_bits: []SoftBit,
+) void {
+    std.debug.assert(out_bits.len >= num_bits);
+    std.debug.assert(num_bits <= max_message_bits);
+
+    const ratio: f64 = @as(f64, @floatFromInt(sample_rate_hz)) / 4_000_000.0;
+    const grid_points = num_bits * 4;
+
+    var grid: [max_message_bits * 4]u16 = undefined;
+
+    for (0..grid_points) |i| {
+        const src: f64 = @as(f64, fractional_offset) + @as(f64, @floatFromInt(i)) * ratio;
+        const src_floor_f = @floor(src);
+        const src_floor: usize = @intFromFloat(@max(src_floor_f, 0.0));
+        const frac: f64 = src - src_floor_f;
+
+        const abs_floor = data_start + src_floor;
+        const abs_ceil = abs_floor + 1;
+
+        const v0: f64 = if (abs_floor < magnitude.len) @floatFromInt(magnitude[abs_floor]) else 0.0;
+        const v1: f64 = if (abs_ceil < magnitude.len) @floatFromInt(magnitude[abs_ceil]) else v0;
+
+        const interp = v0 * (1.0 - frac) + v1 * frac;
+        grid[i] = @intFromFloat(@min(interp, 65535.0));
+    }
+
+    for (0..num_bits) |n| {
+        const base = n * 4;
+        const first_half: i32 = @as(i32, grid[base]) + @as(i32, grid[base + 1]);
+        const second_half: i32 = @as(i32, grid[base + 2]) + @as(i32, grid[base + 3]);
+        const llr: f32 = @floatFromInt(first_half - second_half);
+        out_bits[n] = .{
+            .hard = if (llr >= 0) 1 else 0,
+            .llr_f32 = llr,
+        };
+    }
+}
+
 pub fn computeSignalLevel(magnitude: []const u16, start: usize, num_bits: usize, sample_rate_hz: u32) u16 {
     const num_samples = samplesForBits(num_bits, sample_rate_hz);
     var sum: u64 = 0;
