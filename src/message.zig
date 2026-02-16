@@ -13,7 +13,26 @@ pub const DownlinkFormat = enum(u5) {
     military_extended_squitter = 19,
     comm_b_altitude_reply = 20,
     comm_b_identity_reply = 21,
+    comm_d_elm = 24,
     _,
+
+    pub fn isValid(self: DownlinkFormat) bool {
+        return switch (self) {
+            .short_air_air_surveillance,
+            .altitude_reply,
+            .identity_reply,
+            .all_call_reply,
+            .long_air_air_surveillance,
+            .extended_squitter,
+            .extended_squitter_non_transponder,
+            .military_extended_squitter,
+            .comm_b_altitude_reply,
+            .comm_b_identity_reply,
+            .comm_d_elm,
+            => true,
+            _ => false,
+        };
+    }
 };
 
 pub const IcaoFilter = struct {
@@ -69,6 +88,7 @@ pub const Message = struct {
         );
 
         msg.df = @enumFromInt(df_val);
+        if (!msg.df.isValid()) return null;
         msg.len = if (df_val >= 16) 14 else 7;
         const required_bits = @as(usize, msg.len) * 8;
         if (num_bits < required_bits) return null;
@@ -83,15 +103,40 @@ pub const Message = struct {
                 msg.crc_corrected_bits = result.bits_corrected;
                 if (!msg.crc_ok) return null;
                 msg.icao = @as(u24, msg.raw[1]) << 16 | @as(u24, msg.raw[2]) << 8 | msg.raw[3];
+
+                // For 2+ bit corrections, only accept if ICAO is already known
+                // to avoid false positives from noise
+                if (result.bits_corrected >= 2) {
+                    if (icao_filter) |filter| {
+                        if (!filter.contains(msg.icao)) return null;
+                    }
+                }
+            },
+            .all_call_reply => {
+                // DF11: ICAO is in bytes 1-3 directly, CRC validates via PI field
+                crc.bitsToBytes(msg.soft_bits[0..required_bits], msg.raw[0..msg.len]);
+                const icao: u24 = @as(u24, msg.raw[1]) << 16 | @as(u24, msg.raw[2]) << 8 | msg.raw[3];
+                const remainder = crc.computeCrc24(msg.raw[0..msg.len]);
+                // Upper 17 bits of remainder must be 0 (lower 7 = IID)
+                if (remainder & 0xFFFF80 != 0) return null;
+
+                if (icao_filter) |filter| {
+                    if (!filter.contains(icao)) return null;
+                }
+
+                msg.icao = icao;
+                msg.crc_ok = true;
+                msg.crc_corrected_bits = 0;
             },
             else => {
-                // Other DFs: CRC remainder = ICAO address (address/parity)
+                // DF0/4/5/16/20/21: Address/Parity — CRC of data bytes XOR'd with AP field = ICAO
                 crc.bitsToBytes(msg.soft_bits[0..required_bits], msg.raw[0..msg.len]);
-                const remainder = crc.computeCrc24(msg.raw[0..msg.len]);
-                if (remainder == 0) return null;
-                const icao: u24 = @truncate(remainder);
+                const data_crc = crc.computeCrc24(msg.raw[0 .. msg.len - 3]);
+                const ap: u24 = @as(u24, msg.raw[msg.len - 3]) << 16 |
+                    @as(u24, msg.raw[msg.len - 2]) << 8 |
+                    msg.raw[msg.len - 1];
+                const icao: u24 = @truncate(data_crc ^ ap);
 
-                // Only accept if ICAO was previously seen in a DF17/18
                 if (icao_filter) |filter| {
                     if (!filter.contains(icao)) return null;
                 }
