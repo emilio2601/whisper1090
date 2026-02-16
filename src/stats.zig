@@ -9,6 +9,10 @@ pub const Stats = struct {
     crc_failed: u64,
     unique_aircraft: u32,
     start_time_ns: u64,
+    snr_sum_decoded: f64,
+    snr_count_decoded: u64,
+    snr_sum_failed: f64,
+    snr_count_failed: u64,
 
     pub fn init() Stats {
         return std.mem.zeroes(Stats);
@@ -24,6 +28,8 @@ pub const Stats = struct {
             \\  CRC corrected:      {}
             \\  CRC failed:         {}
             \\  unique aircraft:    {}
+            \\  avg SNR decoded:    {d:.2}
+            \\  avg SNR failed:     {d:.2}
             \\
         , .{
             self.samples_processed,
@@ -33,6 +39,8 @@ pub const Stats = struct {
             self.crc_corrected,
             self.crc_failed,
             self.unique_aircraft,
+            if (self.snr_count_decoded > 0) self.snr_sum_decoded / @as(f64, @floatFromInt(self.snr_count_decoded)) else 0.0,
+            if (self.snr_count_failed > 0) self.snr_sum_failed / @as(f64, @floatFromInt(self.snr_count_failed)) else 0.0,
         });
     }
 
@@ -46,6 +54,8 @@ pub const Stats = struct {
             \\  CRC corrected:      {}
             \\  CRC failed:         {}
             \\  unique aircraft:    {}
+            \\  avg SNR decoded:    {d:.2}
+            \\  avg SNR failed:     {d:.2}
             \\
         , .{
             self.samples_processed,
@@ -55,6 +65,8 @@ pub const Stats = struct {
             self.crc_corrected,
             self.crc_failed,
             self.unique_aircraft,
+            if (self.snr_count_decoded > 0) self.snr_sum_decoded / @as(f64, @floatFromInt(self.snr_count_decoded)) else 0.0,
+            if (self.snr_count_failed > 0) self.snr_sum_failed / @as(f64, @floatFromInt(self.snr_count_failed)) else 0.0,
         });
     }
 };
