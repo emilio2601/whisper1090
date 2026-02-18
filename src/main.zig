@@ -182,16 +182,32 @@ pub fn main() !void {
             const timestamp_ns = (total_sample_offset + pos) * 1_000_000_000 / sample_rate;
             const data_start: usize = pos + preamble_len;
 
-            var decoded = false;
-            var raw_printed = false;
-            const phase_offsets = [_]f32{
-                preamble_result.fractional_offset,
-                preamble_result.fractional_offset - 1.0,
-                preamble_result.fractional_offset + 1.0,
-                preamble_result.fractional_offset - 2.0,
-                preamble_result.fractional_offset + 2.0,
+            const phase_step: f32 = 0.05;
+            const phase_range: f32 = 0.5;
+
+            var phase_buf: [32]f32 = undefined;
+            var n_phases: usize = 0;
+            phase_buf[0] = preamble_result.fractional_offset;
+            n_phases = 1;
+            var sweep: f32 = phase_step;
+            while (sweep <= phase_range + 0.001) : (sweep += phase_step) {
+                if (n_phases + 2 > phase_buf.len) break;
+                phase_buf[n_phases] = preamble_result.fractional_offset - sweep;
+                n_phases += 1;
+                phase_buf[n_phases] = preamble_result.fractional_offset + sweep;
+                n_phases += 1;
+            }
+
+            const BestDecode = struct {
+                msg: Message,
+                signal_level: u16,
+                num_bits: usize,
+                phase_idx: usize,
+                frac_off: f32,
             };
-            decode_loop: for (phase_offsets, 0..) |frac_off, phase_idx| {
+            var best_decode: ?BestDecode = null;
+
+            for (phase_buf[0..n_phases], 0..) |frac_off, phase_idx| {
                 for ([_]usize{ 112, 56 }) |num_bits| {
                     const needed_samples = demod.samplesForBits(num_bits, sample_rate);
                     if (data_start + needed_samples > num_samples) continue;
@@ -208,8 +224,7 @@ pub fn main() !void {
 
                     const signal_level = demod.computeSignalLevel(mag_buf[0..num_samples], data_start, num_bits, sample_rate);
 
-                    if (verbosity >= 2 and !raw_printed and phase_idx == 0 and num_bits == 112) {
-                        raw_printed = true;
+                    if (verbosity >= 2 and phase_idx == 0 and num_bits == 112) {
                         var raw_bytes: [14]u8 = undefined;
                         const crc_mod = @import("crc.zig");
                         crc_mod.bitsToBytes(soft_bits[0..num_bits], &raw_bytes);
@@ -221,58 +236,74 @@ pub fn main() !void {
                     }
 
                     if (Message.fromSoftBits(soft_bits[0..num_bits], num_bits, timestamp_ns, signal_level, &icao_filter)) |msg| {
-                        stats.snr_sum_decoded += preamble_result.score;
-                        stats.snr_count_decoded += 1;
-                        stats.messages_decoded += 1;
-                        if (msg.crc_corrected_bits > 0) {
-                            stats.crc_corrected += 1;
-                        } else {
-                            stats.crc_ok += 1;
-                        }
+                        const better = if (best_decode) |best|
+                            msg.score > best.msg.score
+                        else
+                            true;
 
-                        if (verbosity >= 1) {
-                            std.debug.print("DECODE: [{X:0>6}] DF{d} bits={d} phase={d}/{d:.2} crc_fix={d} sig={d} snr={d:.1} sample={d}\n", .{
-                                msg.icao,
-                                @intFromEnum(msg.df),
-                                num_bits,
-                                phase_idx,
-                                frac_off,
-                                msg.crc_corrected_bits,
-                                signal_level,
-                                preamble_result.score,
-                                total_sample_offset + pos,
-                            });
+                        if (better) {
+                            best_decode = .{
+                                .msg = msg,
+                                .signal_level = signal_level,
+                                .num_bits = num_bits,
+                                .phase_idx = phase_idx,
+                                .frac_off = frac_off,
+                            };
                         }
-
-                        if (msg.df == .extended_squitter or msg.df == .extended_squitter_non_transponder) {
-                            icao_filter.add(msg.icao);
-                        }
-
-                        const payload = decode.decodeExtendedSquitter(&msg);
-                        const ac = table.getOrCreate(msg.icao) catch null;
-                        if (ac) |a| {
-                            a.updateFromPayload(payload, msg.timestamp_ns);
-                            if (a.messages_received == 1) {
-                                stats.unique_aircraft += 1;
-                            }
-                        }
-
-                        if (!quiet) {
-                            switch (output_format) {
-                                .text => printMessage(stdout, &msg, payload) catch {},
-                                .beast => beast.writeBeastMessage(stdout, &msg) catch {},
-                            }
-                        }
-
-                        const skip_samples = demod.samplesForBits(num_bits, sample_rate);
-                        pos = data_start + skip_samples;
-                        decoded = true;
-                        break :decode_loop;
                     }
                 }
             }
 
-            if (!decoded) {
+            if (best_decode) |best| {
+                const msg = best.msg;
+
+                stats.snr_sum_decoded += preamble_result.score;
+                stats.snr_count_decoded += 1;
+                stats.messages_decoded += 1;
+                if (msg.crc_corrected_bits > 0) {
+                    stats.crc_corrected += 1;
+                } else {
+                    stats.crc_ok += 1;
+                }
+
+                if (verbosity >= 1) {
+                    std.debug.print("DECODE: [{X:0>6}] DF{d} bits={d} phase={d}/{d:.2} crc_fix={d} score={d} sig={d} snr={d:.1} sample={d}\n", .{
+                        msg.icao,
+                        @intFromEnum(msg.df),
+                        best.num_bits,
+                        best.phase_idx,
+                        best.frac_off,
+                        msg.crc_corrected_bits,
+                        msg.score,
+                        best.signal_level,
+                        preamble_result.score,
+                        total_sample_offset + pos,
+                    });
+                }
+
+                if (msg.df == .extended_squitter or msg.df == .extended_squitter_non_transponder) {
+                    icao_filter.add(msg.icao);
+                }
+
+                const payload = decode.decodeExtendedSquitter(&msg);
+                const ac = table.getOrCreate(msg.icao) catch null;
+                if (ac) |a| {
+                    a.updateFromPayload(payload, msg.timestamp_ns);
+                    if (a.messages_received == 1) {
+                        stats.unique_aircraft += 1;
+                    }
+                }
+
+                if (!quiet) {
+                    switch (output_format) {
+                        .text => printMessage(stdout, &msg, payload) catch {},
+                        .beast => beast.writeBeastMessage(stdout, &msg) catch {},
+                    }
+                }
+
+                const skip_samples = demod.samplesForBits(best.num_bits, sample_rate);
+                pos = data_start + skip_samples;
+            } else {
                 stats.snr_sum_failed += preamble_result.score;
                 stats.snr_count_failed += 1;
                 stats.crc_failed += 1;
