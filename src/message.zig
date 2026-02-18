@@ -119,11 +119,11 @@ pub const Message = struct {
                 msg.icao = @as(u24, msg.raw[1]) << 16 | @as(u24, msg.raw[2]) << 8 | msg.raw[3];
 
                 const icao_known = if (icao_filter) |filter| filter.contains(msg.icao) else false;
-
-                // For 2+ bit corrections, only accept if ICAO is already known
-                // to avoid false positives from noise
-                if (result.bits_corrected >= 2 and !icao_known) {
-                    return null;
+                if (result.bits_corrected >= 1 and !icao_known) {
+                    // DF17 fix=1 from unknown ICAO: accept (24-bit CRC syndrome match)
+                    // DF18 or fix=2+: require known ICAO (DF18 is non-transponder,
+                    // multi-bit correction on unknown is too noisy)
+                    if (msg.df != .extended_squitter or result.bits_corrected >= 2) return null;
                 }
 
                 if (result.bits_corrected == 0) {
