@@ -15,7 +15,7 @@ const CHUNK_SIZE = 256 * 1024;
 const OVERLAP_SAMPLES = 512;
 const OVERLAP_BYTES = OVERLAP_SAMPLES * 2;
 
-const OutputFormat = enum { text, beast };
+const OutputFormat = enum { text, beast, raw };
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -60,8 +60,10 @@ pub fn main() !void {
                 output_format = .beast;
             } else if (std.mem.eql(u8, args[i], "text")) {
                 output_format = .text;
+            } else if (std.mem.eql(u8, args[i], "raw")) {
+                output_format = .raw;
             } else {
-                std.debug.print("Unknown format: {s} (expected: text, beast)\n", .{args[i]});
+                std.debug.print("Unknown format: {s} (expected: text, beast, raw)\n", .{args[i]});
                 return;
             }
         } else if (std.mem.eql(u8, args[i], "--stats")) {
@@ -87,7 +89,7 @@ pub fn main() !void {
                 \\  --limit <samples>        Stop after processing N samples
                 \\
                 \\Output:
-                \\  --format text|beast      Output format (default: text)
+                \\  --format text|beast|raw  Output format (default: text)
                 \\  -q, --quiet              Suppress message output on stdout
                 \\  --stats                  Print summary statistics to stderr
                 \\
@@ -308,6 +310,13 @@ pub fn main() !void {
                     switch (output_format) {
                         .text => printMessage(stdout, &msg, payload) catch {},
                         .beast => beast.writeBeastMessage(stdout, &msg) catch {},
+                        .raw => {
+                            stdout.print("*", .{}) catch {};
+                            for (msg.raw[0..msg.len]) |b| {
+                                stdout.print("{X:0>2}", .{b}) catch {};
+                            }
+                            stdout.print(";\n", .{}) catch {};
+                        },
                     }
                 }
 
