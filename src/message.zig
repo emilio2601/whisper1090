@@ -178,15 +178,48 @@ pub const Message = struct {
                 const ap: u24 = @as(u24, msg.raw[msg.len - 3]) << 16 |
                     @as(u24, msg.raw[msg.len - 2]) << 8 |
                     msg.raw[msg.len - 1];
-                const icao: u24 = @truncate(data_crc ^ ap);
+                const base_icao: u24 = @truncate(data_crc ^ ap);
 
                 if (icao_filter) |filter| {
-                    if (!filter.contains(icao)) return null;
-                }
+                    if (filter.contains(base_icao)) {
+                        msg.icao = base_icao;
+                        msg.crc_ok = true;
+                        msg.crc_corrected_bits = 0;
+                    } else {
+                        // Soft 1-bit correction: try weakest bits, check if flipping
+                        // produces a known ICAO via the address/parity relationship
+                        const data_bits = (@as(usize, msg.len) - 3) * 8;
+                        const syn_table = if (msg.len == 14) &crc.SyndromeTable88.table else &crc.SyndromeTable32.table;
 
-                msg.icao = icao;
-                msg.crc_ok = true;
-                msg.crc_corrected_bits = 0;
+                        const max_candidates: usize = 15;
+                        var candidates: [max_candidates]usize = undefined;
+                        const n_cand = crc.collectWeakBits(msg.soft_bits[0..required_bits], candidates[0..max_candidates]);
+
+                        var corrected = false;
+                        for (candidates[0..n_cand]) |bit_pos| {
+                            const candidate_icao: u24 = if (bit_pos < data_bits)
+                                @truncate(base_icao ^ syn_table[bit_pos])
+                            else
+                                base_icao ^ (@as(u24, 1) << @intCast(23 - (bit_pos - data_bits)));
+
+                            if (filter.contains(candidate_icao)) {
+                                crc.flipBit(msg.raw[0..msg.len], bit_pos);
+                                msg.soft_bits[bit_pos].hard ^= 1;
+                                msg.icao = candidate_icao;
+                                msg.crc_ok = true;
+                                msg.crc_corrected_bits = 1;
+                                corrected = true;
+                                break;
+                            }
+                        }
+
+                        if (!corrected) return null;
+                    }
+                } else {
+                    msg.icao = base_icao;
+                    msg.crc_ok = true;
+                    msg.crc_corrected_bits = 0;
+                }
             },
         }
 
