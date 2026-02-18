@@ -5,7 +5,9 @@ pub const Stats = struct {
     preambles_detected: u64,
     messages_decoded: u64,
     crc_ok: u64,
-    crc_corrected: u64,
+    crc_corrected_1bit: u64,
+    crc_corrected_2bit: u64,
+    crc_corrected_3bit: u64,
     crc_failed: u64,
     unique_aircraft: u32,
     start_time_ns: u64,
@@ -25,7 +27,9 @@ pub const Stats = struct {
             \\  preambles detected: {}
             \\  messages decoded:   {}
             \\  CRC ok:             {}
-            \\  CRC corrected:      {}
+            \\  CRC corrected 1-bit:{}
+            \\  CRC corrected 2-bit:{}
+            \\  CRC corrected 3-bit:{}
             \\  CRC failed:         {}
             \\  unique aircraft:    {}
             \\  avg SNR decoded:    {d:.2}
@@ -36,7 +40,9 @@ pub const Stats = struct {
             self.preambles_detected,
             self.messages_decoded,
             self.crc_ok,
-            self.crc_corrected,
+            self.crc_corrected_1bit,
+            self.crc_corrected_2bit,
+            self.crc_corrected_3bit,
             self.crc_failed,
             self.unique_aircraft,
             if (self.snr_count_decoded > 0) self.snr_sum_decoded / @as(f64, @floatFromInt(self.snr_count_decoded)) else 0.0,
@@ -51,7 +57,9 @@ pub const Stats = struct {
             \\  preambles detected: {}
             \\  messages decoded:   {}
             \\  CRC ok:             {}
-            \\  CRC corrected:      {}
+            \\  CRC corrected 1-bit:{}
+            \\  CRC corrected 2-bit:{}
+            \\  CRC corrected 3-bit:{}
             \\  CRC failed:         {}
             \\  unique aircraft:    {}
             \\  avg SNR decoded:    {d:.2}
@@ -62,7 +70,9 @@ pub const Stats = struct {
             self.preambles_detected,
             self.messages_decoded,
             self.crc_ok,
-            self.crc_corrected,
+            self.crc_corrected_1bit,
+            self.crc_corrected_2bit,
+            self.crc_corrected_3bit,
             self.crc_failed,
             self.unique_aircraft,
             if (self.snr_count_decoded > 0) self.snr_sum_decoded / @as(f64, @floatFromInt(self.snr_count_decoded)) else 0.0,

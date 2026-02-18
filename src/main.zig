@@ -260,10 +260,11 @@ pub fn main() !void {
                 stats.snr_sum_decoded += preamble_result.score;
                 stats.snr_count_decoded += 1;
                 stats.messages_decoded += 1;
-                if (msg.crc_corrected_bits > 0) {
-                    stats.crc_corrected += 1;
-                } else {
-                    stats.crc_ok += 1;
+                switch (msg.crc_corrected_bits) {
+                    0 => stats.crc_ok += 1,
+                    1 => stats.crc_corrected_1bit += 1,
+                    2 => stats.crc_corrected_2bit += 1,
+                    else => stats.crc_corrected_3bit += 1,
                 }
 
                 if (verbosity >= 1) {
