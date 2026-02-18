@@ -114,19 +114,62 @@ pub const Message = struct {
             },
             .all_call_reply => {
                 // DF11: ICAO is in bytes 1-3 directly, CRC validates via PI field
+                // Must use CRC(data_bytes) XOR PI, not CRC(all_bytes), because
+                // PI = CRC(data) XOR IID, and CRC(all_bytes) != IID for IID != 0
                 crc.bitsToBytes(msg.soft_bits[0..required_bits], msg.raw[0..msg.len]);
-                const icao: u24 = @as(u24, msg.raw[1]) << 16 | @as(u24, msg.raw[2]) << 8 | msg.raw[3];
-                const remainder = crc.computeCrc24(msg.raw[0..msg.len]);
-                // Upper 17 bits of remainder must be 0 (lower 7 = IID)
-                if (remainder & 0xFFFF80 != 0) return null;
+                const data_crc = crc.computeCrc24(msg.raw[0 .. msg.len - 3]);
+                const pi: u24 = @as(u24, msg.raw[msg.len - 3]) << 16 |
+                    @as(u24, msg.raw[msg.len - 2]) << 8 |
+                    msg.raw[msg.len - 1];
+                const remainder: u24 = @truncate(data_crc ^ pi);
 
-                if (icao_filter) |filter| {
-                    if (!filter.contains(icao)) return null;
+                if (remainder & 0xFFFF80 == 0) {
+                    const icao: u24 = @as(u24, msg.raw[1]) << 16 | @as(u24, msg.raw[2]) << 8 | msg.raw[3];
+                    if (icao_filter) |filter| {
+                        if (!filter.contains(icao)) return null;
+                    }
+                    msg.icao = icao;
+                    msg.crc_ok = true;
+                    msg.crc_corrected_bits = 0;
+                } else {
+                    // Soft 1-bit correction: try weakest bits
+                    // Syndromes differ for data bits vs PI bits (same pattern as AP)
+                    const data_bits: usize = (@as(usize, msg.len) - 3) * 8;
+                    const max_candidates: usize = 15;
+                    var candidates: [max_candidates]usize = undefined;
+                    const n_cand = crc.collectWeakBits(msg.soft_bits[0..required_bits], candidates[0..max_candidates]);
+
+                    var corrected = false;
+                    for (candidates[0..n_cand]) |bit_pos| {
+                        const syndrome: u24 = if (bit_pos < data_bits)
+                            @truncate(crc.SyndromeTable32.table[bit_pos])
+                        else
+                            @as(u24, 1) << @intCast(23 - (bit_pos - data_bits));
+                        const new_remainder = remainder ^ syndrome;
+                        if (new_remainder & 0xFFFF80 != 0) continue;
+
+                        crc.flipBit(msg.raw[0..msg.len], bit_pos);
+                        msg.soft_bits[bit_pos].hard ^= 1;
+                        const icao: u24 = @as(u24, msg.raw[1]) << 16 | @as(u24, msg.raw[2]) << 8 | msg.raw[3];
+
+                        if (icao_filter) |filter| {
+                            if (!filter.contains(icao)) {
+                                // Undo the flip and try next candidate
+                                crc.flipBit(msg.raw[0..msg.len], bit_pos);
+                                msg.soft_bits[bit_pos].hard ^= 1;
+                                continue;
+                            }
+                        }
+
+                        msg.icao = icao;
+                        msg.crc_ok = true;
+                        msg.crc_corrected_bits = 1;
+                        corrected = true;
+                        break;
+                    }
+
+                    if (!corrected) return null;
                 }
-
-                msg.icao = icao;
-                msg.crc_ok = true;
-                msg.crc_corrected_bits = 0;
             },
             else => {
                 // DF0/4/5/16/20/21: Address/Parity — CRC of data bytes XOR'd with AP field = ICAO
