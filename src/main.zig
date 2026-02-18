@@ -121,6 +121,7 @@ pub fn main() !void {
     }
 
     var stats = stats_mod.Stats.init();
+    stats.sample_rate = sample_rate;
     var table = aircraft_mod.AircraftTable.init(allocator);
     defer table.deinit();
     var icao_filter = message_mod.IcaoFilter.init(allocator);
@@ -144,6 +145,8 @@ pub fn main() !void {
 
     const stop_at_sample = if (limit_samples) |limit| seek_samples + limit else null;
 
+    const timer_start = try std.time.Instant.now();
+
     while (true) {
         if (stop_at_sample) |stop| {
             if (total_sample_offset >= stop) break;
@@ -163,7 +166,9 @@ pub fn main() !void {
         if (aligned_bytes < 2) break;
 
         const num_samples = aligned_bytes / 2;
+        const t_mag = try std.time.Instant.now();
         magnitude.computeMagnitude(read_buf[0..aligned_bytes], mag_buf[0..num_samples]);
+        stats.time_magnitude_ns += (try std.time.Instant.now()).since(t_mag);
         stats.samples_processed += num_samples;
 
         var pos: usize = 0;
@@ -207,11 +212,13 @@ pub fn main() !void {
             };
             var best_decode: ?BestDecode = null;
 
+            const t_phase = try std.time.Instant.now();
             for (phase_buf[0..n_phases], 0..) |frac_off, phase_idx| {
                 for ([_]usize{ 112, 56 }) |num_bits| {
                     const needed_samples = demod.samplesForBits(num_bits, sample_rate);
                     if (data_start + needed_samples > num_samples) continue;
 
+                    stats.phase_attempts += 1;
                     var soft_bits: [112]SoftBit = undefined;
                     demod.resampleAndExtract(
                         mag_buf[0..num_samples],
@@ -253,6 +260,8 @@ pub fn main() !void {
                     }
                 }
             }
+
+            stats.time_phase_search_ns += (try std.time.Instant.now()).since(t_phase);
 
             if (best_decode) |best| {
                 const msg = best.msg;
@@ -325,6 +334,8 @@ pub fn main() !void {
     }
 
     try stdout.flush();
+
+    stats.time_total_ns = (try std.time.Instant.now()).since(timer_start);
 
     if (show_stats) {
         stats.debugPrint();
