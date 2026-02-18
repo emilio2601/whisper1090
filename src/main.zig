@@ -33,6 +33,7 @@ pub fn main() !void {
     var quiet = false;
     var verbosity: u8 = 0;
     var output_format: OutputFormat = .text;
+    var probe_sample: ?u64 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -51,6 +52,12 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--limit") and i + 1 < args.len) {
             limit_samples = std.fmt.parseInt(u64, args[i + 1], 10) catch {
                 std.debug.print("Invalid --limit value: {s}\n", .{args[i + 1]});
+                return;
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--probe") and i + 1 < args.len) {
+            probe_sample = std.fmt.parseInt(u64, args[i + 1], 10) catch {
+                std.debug.print("Invalid --probe value: {s}\n", .{args[i + 1]});
                 return;
             };
             i += 1;
@@ -114,6 +121,11 @@ pub fn main() !void {
 
     const file = try std.fs.cwd().openFile(ifile_path.?, .{});
     defer file.close();
+
+    if (probe_sample) |ps| {
+        runProbe(file, ps, sample_rate);
+        return;
+    }
 
     if (seek_samples > 0) {
         file.seekTo(seek_samples * 2) catch |err| {
@@ -386,6 +398,167 @@ fn printMessage(writer: anytype, msg: *const Message, payload: decode.DecodedPay
             }
             try writer.print("{s}\n", .{corrected_str});
         },
+    }
+}
+
+fn runProbe(file: std.fs.File, probe_pos: u64, sample_rate: u32) void {
+    const crc_mod = @import("crc.zig");
+    const p = std.debug.print;
+
+    const margin: u64 = 50;
+    const read_start = if (probe_pos > margin) probe_pos - margin else 0;
+    file.seekTo(read_start * 2) catch |err| {
+        p("Failed to seek: {}\n", .{err});
+        return;
+    };
+
+    var iq_buf: [2048]u8 = undefined;
+    const bytes_read = file.read(&iq_buf) catch |err| {
+        p("Failed to read: {}\n", .{err});
+        return;
+    };
+    const num_samples = bytes_read / 2;
+    if (num_samples < 100) {
+        p("Not enough data\n", .{});
+        return;
+    }
+
+    var mag_buf: [1024]u16 = undefined;
+    magnitude.computeMagnitude(iq_buf[0 .. num_samples * 2], mag_buf[0..num_samples]);
+
+    const local_pos: usize = @intCast(probe_pos - read_start);
+    const preamble_len = preamble.preambleSamples(sample_rate);
+
+    p("=== PROBE sample {d} ===\n\n", .{probe_pos});
+
+    p("Magnitude around probe (offset from probe):\n", .{});
+    const mag_start = if (local_pos > 5) local_pos - 5 else 0;
+    const mag_end = @min(local_pos + preamble_len + 30, num_samples);
+    for (mag_start..mag_end) |si| {
+        const file_pos = read_start + si;
+        const marker: u8 = if (si == local_pos) '>' else ' ';
+        p("  {c} [{d:>8}] +{d:>3}: mag={d:>5}\n", .{ marker, file_pos, @as(i64, @intCast(si)) - @as(i64, @intCast(local_pos)), mag_buf[si] });
+    }
+
+    p("\nPreamble detection at probe and +-5 samples:\n", .{});
+    const search_start = if (local_pos > 5) local_pos - 5 else 0;
+    const search_end = @min(local_pos + 6, num_samples);
+    for (search_start..search_end) |si| {
+        const result = preamble.detectPreamble(mag_buf[0..num_samples], si, sample_rate);
+        const file_pos = read_start + si;
+        if (result) |r| {
+            const marker: u8 = if (si == local_pos) '>' else ' ';
+            p("  {c} [{d:>8}] score={d:.2} frac={d:.3}\n", .{ marker, file_pos, r.score, r.fractional_offset });
+        } else {
+            const marker: u8 = if (si == local_pos) '>' else ' ';
+            p("  {c} [{d:>8}] no preamble\n", .{ marker, file_pos });
+        }
+    }
+
+    var best_preamble_pos: ?usize = null;
+    var best_score: f32 = 0;
+    for (search_start..search_end) |si| {
+        const result = preamble.detectPreamble(mag_buf[0..num_samples], si, sample_rate);
+        if (result) |r| {
+            if (r.score > best_score) {
+                best_score = r.score;
+                best_preamble_pos = si;
+            }
+        }
+    }
+
+    if (best_preamble_pos == null) {
+        p("\nNo preamble detected in search window.\n", .{});
+        return;
+    }
+
+    const bp = best_preamble_pos.?;
+    const pr = preamble.detectPreamble(mag_buf[0..num_samples], bp, sample_rate).?;
+    p("\nBest preamble at [{d}] score={d:.2} frac={d:.3}\n", .{ read_start + bp, pr.score, pr.fractional_offset });
+
+    const data_start = bp + preamble_len;
+    for ([_]usize{ 112, 56 }) |num_bits| {
+        const needed = demod.samplesForBits(num_bits, sample_rate);
+        if (data_start + needed > num_samples) continue;
+
+        p("\n--- {d}-bit extraction ---\n", .{num_bits});
+
+        const phase_offsets = [_]f32{ pr.fractional_offset, pr.fractional_offset - 0.05, pr.fractional_offset + 0.05, pr.fractional_offset - 0.1, pr.fractional_offset + 0.1 };
+        for (phase_offsets, 0..) |frac_off, phase_idx| {
+            var soft_bits: [112]SoftBit = undefined;
+            demod.resampleAndExtract(
+                mag_buf[0..num_samples],
+                data_start,
+                frac_off,
+                num_bits,
+                sample_rate,
+                soft_bits[0..num_bits],
+            );
+
+            var raw_bytes: [14]u8 = undefined;
+            const msg_len = num_bits / 8;
+            crc_mod.bitsToBytes(soft_bits[0..num_bits], raw_bytes[0..msg_len]);
+
+            p("  phase[{d}] frac={d:.3}: ", .{ phase_idx, frac_off });
+            for (raw_bytes[0..msg_len]) |b| {
+                p("{X:0>2}", .{b});
+            }
+
+            if (num_bits == 112) {
+                const syndrome = crc_mod.computeCrc24(raw_bytes[0..msg_len]);
+                p("  CRC={X:0>6}", .{syndrome});
+                if (syndrome == 0) {
+                    p(" OK!", .{});
+                }
+            } else {
+                const syndrome = crc_mod.computeCrc24(raw_bytes[0..msg_len]);
+                p("  CRC={X:0>6}", .{syndrome});
+            }
+
+            p("\n", .{});
+
+            if (phase_idx == 0) {
+                p("  LLRs: ", .{});
+                for (0..num_bits) |bi| {
+                    if (bi > 0 and bi % 8 == 0) p(" ", .{});
+                    const llr = soft_bits[bi].llr_f32;
+                    if (@abs(llr) < 2.0) {
+                        p("{d:.1}", .{llr});
+                    } else {
+                        p("{d:.0}", .{llr});
+                    }
+                    if (bi + 1 < num_bits) p(",", .{});
+                }
+                p("\n", .{});
+
+                var weakest: [8]struct { idx: usize, llr: f32 } = undefined;
+                var weak_count: usize = 0;
+                for (0..num_bits) |bi| {
+                    const a = @abs(soft_bits[bi].llr_f32);
+                    if (weak_count < 8) {
+                        weakest[weak_count] = .{ .idx = bi, .llr = soft_bits[bi].llr_f32 };
+                        weak_count += 1;
+                    } else {
+                        var max_idx: usize = 0;
+                        var max_abs: f32 = 0;
+                        for (0..8) |wi| {
+                            if (@abs(weakest[wi].llr) > max_abs) {
+                                max_abs = @abs(weakest[wi].llr);
+                                max_idx = wi;
+                            }
+                        }
+                        if (a < max_abs) {
+                            weakest[max_idx] = .{ .idx = bi, .llr = soft_bits[bi].llr_f32 };
+                        }
+                    }
+                }
+                p("  Weakest bits: ", .{});
+                for (0..weak_count) |wi| {
+                    p("bit{d}(llr={d:.2}) ", .{ weakest[wi].idx, weakest[wi].llr });
+                }
+                p("\n", .{});
+            }
+        }
     }
 }
 
