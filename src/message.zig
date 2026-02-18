@@ -62,9 +62,21 @@ pub const Message = struct {
     icao: u24,
     crc_ok: bool,
     crc_corrected_bits: u8,
+    score: u16,
     soft_bits: [112]SoftBit,
     signal_level_u16: u16,
     timestamp_ns: u64,
+
+    pub fn computeScore(tier: u16, soft_bits: []const SoftBit, msg_len: u8) u16 {
+        const msg_bits: usize = @as(usize, msg_len) * 8;
+        var sum: f32 = 0;
+        for (soft_bits[0..msg_bits]) |sb| {
+            sum += @abs(sb.llr_f32);
+        }
+        const mean_llr = sum / @as(f32, @floatFromInt(msg_bits));
+        const llr_bonus: u16 = @intFromFloat(@min(mean_llr * 2.0, 255.0));
+        return tier * 256 + llr_bonus;
+    }
 
     pub fn fromSoftBits(
         soft_bits: []SoftBit,
@@ -95,6 +107,8 @@ pub const Message = struct {
 
         @memcpy(msg.soft_bits[0..required_bits], soft_bits[0..required_bits]);
 
+        var tier: u16 = 0;
+
         switch (msg.df) {
             .extended_squitter, .extended_squitter_non_transponder => {
                 // DF17/18: CRC covers entire message, remainder must be 0
@@ -104,12 +118,20 @@ pub const Message = struct {
                 if (!msg.crc_ok) return null;
                 msg.icao = @as(u24, msg.raw[1]) << 16 | @as(u24, msg.raw[2]) << 8 | msg.raw[3];
 
+                const icao_known = if (icao_filter) |filter| filter.contains(msg.icao) else false;
+
                 // For 2+ bit corrections, only accept if ICAO is already known
                 // to avoid false positives from noise
-                if (result.bits_corrected >= 2) {
-                    if (icao_filter) |filter| {
-                        if (!filter.contains(msg.icao)) return null;
-                    }
+                if (result.bits_corrected >= 2 and !icao_known) {
+                    return null;
+                }
+
+                if (result.bits_corrected == 0) {
+                    tier = if (icao_known) 6 else 5;
+                } else if (result.bits_corrected == 1) {
+                    tier = if (icao_known) 4 else 1;
+                } else {
+                    tier = 2;
                 }
             },
             .all_call_reply => {
@@ -131,6 +153,7 @@ pub const Message = struct {
                     msg.icao = icao;
                     msg.crc_ok = true;
                     msg.crc_corrected_bits = 0;
+                    tier = if (remainder == 0) @as(u16, 4) else @as(u16, 3);
                 } else {
                     // Soft 1-bit correction: try weakest bits
                     // Syndromes differ for data bits vs PI bits (same pattern as AP)
@@ -165,6 +188,7 @@ pub const Message = struct {
                         msg.crc_ok = true;
                         msg.crc_corrected_bits = 1;
                         corrected = true;
+                        tier = 2;
                         break;
                     }
 
@@ -185,6 +209,7 @@ pub const Message = struct {
                         msg.icao = base_icao;
                         msg.crc_ok = true;
                         msg.crc_corrected_bits = 0;
+                        tier = 3;
                     } else {
                         // Soft 1-bit correction: try weakest bits, check if flipping
                         // produces a known ICAO via the address/parity relationship
@@ -209,6 +234,7 @@ pub const Message = struct {
                                 msg.crc_ok = true;
                                 msg.crc_corrected_bits = 1;
                                 corrected = true;
+                                tier = 2;
                                 break;
                             }
                         }
@@ -223,6 +249,7 @@ pub const Message = struct {
             },
         }
 
+        msg.score = computeScore(tier, &msg.soft_bits, msg.len);
         return msg;
     }
 };
