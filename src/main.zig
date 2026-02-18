@@ -281,7 +281,7 @@ pub fn main() !void {
                     });
                 }
 
-                if (msg.df == .extended_squitter or msg.df == .extended_squitter_non_transponder) {
+                if (msg.df == .extended_squitter and msg.crc_corrected_bits == 0) {
                     icao_filter.add(msg.icao);
                 }
 
