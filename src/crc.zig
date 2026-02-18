@@ -102,7 +102,7 @@ fn SyndromeTableFor(comptime n_bits: usize) type {
     const n_bytes = n_bits / 8;
 
     return struct {
-        const table: [n_bits]u32 = blk: {
+        pub const table: [n_bits]u32 = blk: {
             var t: [n_bits]u32 = undefined;
             for (0..n_bits) |bit_pos| {
                 var temp: [n_bytes]u8 = .{0} ** n_bytes;
@@ -165,8 +165,11 @@ fn SyndromeTableFor(comptime n_bits: usize) type {
     };
 }
 
-const SyndromeTable56 = SyndromeTableFor(56);
-const SyndromeTable112 = SyndromeTableFor(112);
+pub const SyndromeTable56 = SyndromeTableFor(56);
+pub const SyndromeTable112 = SyndromeTableFor(112);
+
+pub const SyndromeTable32 = SyndromeTableFor(32);
+pub const SyndromeTable88 = SyndromeTableFor(88);
 
 fn computeCrc24Comptime(data: []const u8) u32 {
     @setEvalBranchQuota(100_000);
@@ -192,7 +195,7 @@ fn syndromeForBit(bit_pos: usize, msg_len: usize) u32 {
     return computeCrc24(temp[0..msg_len]);
 }
 
-fn collectWeakBits(soft_bits: []const SoftBit, out: []usize) usize {
+pub fn collectWeakBits(soft_bits: []const SoftBit, out: []usize) usize {
     var abs_llrs: [112]struct { idx: usize, abs_llr: f32 } = undefined;
     for (soft_bits, 0..) |bit, i| {
         abs_llrs[i] = .{ .idx = i, .abs_llr = @abs(bit.llr_f32) };
@@ -212,7 +215,7 @@ fn collectWeakBits(soft_bits: []const SoftBit, out: []usize) usize {
     return n;
 }
 
-fn flipBit(bytes: []u8, bit_pos: usize) void {
+pub fn flipBit(bytes: []u8, bit_pos: usize) void {
     const byte_idx = bit_pos / 8;
     const bit_idx: u3 = @intCast(7 - (bit_pos % 8));
     bytes[byte_idx] ^= @as(u8, 1) << bit_idx;
